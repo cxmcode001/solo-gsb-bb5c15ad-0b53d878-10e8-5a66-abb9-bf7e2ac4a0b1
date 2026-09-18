@@ -255,6 +255,30 @@ class ParticipantCompareOut(BaseModel):
     intervals: List[CompareIntervalOut]
 
 
+class ThresholdIntervalOut(BaseModel):
+    """One closed, maximal run of consecutive revisions at/above a threshold."""
+
+    start_revision: int
+    end_revision: int
+    start_points: int = Field(
+        description="The participant's effective total at start_revision."
+    )
+    end_points: int = Field(
+        description="The participant's effective total at end_revision."
+    )
+
+
+class ThresholdIntervalsOut(BaseModel):
+    participant_id: str
+    threshold: int
+    from_revision: int
+    to_revision: int
+    intervals: List[ThresholdIntervalOut] = Field(
+        description="Closed revision intervals where total_points >= threshold, "
+        "sorted by start_revision ascending."
+    )
+
+
 class RewardPreviewIn(BaseModel):
     """Request body for ``POST /rewards/preview`` (read-only dry run)."""
 

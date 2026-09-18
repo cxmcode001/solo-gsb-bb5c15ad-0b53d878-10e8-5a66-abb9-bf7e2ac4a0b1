@@ -38,6 +38,8 @@ from .schemas import (
     RewardWinnerOut,
     ScoreBreakdownOut,
     ScoreContribution,
+    ThresholdIntervalOut,
+    ThresholdIntervalsOut,
 )
 
 
@@ -888,6 +890,104 @@ def participant_compare(
     return ParticipantCompareOut(
         left_id=left_id,
         right_id=right_id,
+        from_revision=from_revision,
+        to_revision=to_revision,
+        intervals=intervals,
+    )
+
+
+def threshold_intervals(
+    participant_id: str,
+    threshold: int,
+    from_revision: int,
+    to_revision: int,
+) -> ThresholdIntervalsOut:
+    """Consecutive-revision intervals where one participant meets a threshold.
+
+    The participant's effective total is recomputed for *every* revision in
+    ``[from_revision, to_revision]`` under the same rule as ``/leaderboard``:
+    an event counts iff it exists at R and no correction existing at R
+    supersedes it. Events are replayed once in revision order (same machinery
+    as ``/participants/compare``): an event becomes effective the moment it is
+    written and stops being effective at its *first* direct correction, so a
+    correction that re-attributes an event from participant A to B subtracts
+    from A and adds to B at the correction's own revision; a forked chain
+    keeps every branch tip effective and supersedes the shared ancestor only
+    once. Hence rises and falls caused by correction-chain forks and by
+    cross-participant corrections are all reflected.
+
+    Consecutive revisions whose recomputed total is ``>= threshold`` (border
+    inclusive) merge into one closed interval; endpoints carry the totals at
+    both ends, which may differ as long as they stay at/above the threshold.
+
+    Validation order matches ``/participants/compare``: ordering errors
+    (negative, ``from_revision > to_revision``) are 422, a ``to_revision``
+    beyond the current maximum is 404. ``from_revision == 0`` denotes the
+    empty ledger. A participant that never appears is treated as 0 points at
+    every revision. Read-only.
+    """
+    if from_revision < 0 or from_revision > to_revision:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "require 0 <= from_revision <= to_revision, got "
+                f"from_revision={from_revision}, to_revision={to_revision}"
+            ),
+        )
+
+    with read_tx() as conn:
+        max_rev = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM events"
+        ).fetchone()[0]
+        if to_revision > max_rev:
+            raise HTTPException(
+                status_code=404, detail=f"revision {to_revision} not found"
+            )
+        rows = conn.execute(
+            "SELECT event_id, participant_id, points, correction_of, revision"
+            " FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (to_revision,),
+        ).fetchall()
+
+    by_revision: dict[int, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_revision.setdefault(r["revision"], []).append(r)
+
+    points_by_id: dict[str, Tuple[str, int]] = {}
+    superseded: set[str] = set()
+    total = 0
+    intervals: list[ThresholdIntervalOut] = []
+    for rev in range(0, to_revision + 1):
+        for r in by_revision.get(rev, ()):
+            if r["participant_id"] == participant_id:
+                total += r["points"]
+            points_by_id[r["event_id"]] = (r["participant_id"], r["points"])
+            target = r["correction_of"]
+            if target is not None and target not in superseded:
+                # First correction of ``target``: it stops being effective at
+                # this revision, so its points leave the old owner's total.
+                superseded.add(target)
+                t_pid, t_points = points_by_id[target]
+                if t_pid == participant_id:
+                    total -= t_points
+        if rev < from_revision:
+            continue
+        if total >= threshold:
+            if intervals and intervals[-1].end_revision == rev - 1:
+                intervals[-1].end_revision = rev
+                intervals[-1].end_points = total
+            else:
+                intervals.append(
+                    ThresholdIntervalOut(
+                        start_revision=rev,
+                        end_revision=rev,
+                        start_points=total,
+                        end_points=total,
+                    )
+                )
+    return ThresholdIntervalsOut(
+        participant_id=participant_id,
+        threshold=threshold,
         from_revision=from_revision,
         to_revision=to_revision,
         intervals=intervals,

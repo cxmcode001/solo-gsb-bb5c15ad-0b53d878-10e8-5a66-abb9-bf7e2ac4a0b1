@@ -10,6 +10,7 @@
 - **递增 revision**：每次成功写入获得严格递增的 revision；可查询当前或任一历史 revision 的排行榜与生效明细。
 - **奖励结算预演**：`POST /rewards/preview` 按指定 revision 的排行榜只读试算奖金分配——并列组共享合并后的奖金池、余数按 `participant_id` 升序分配，不写入账本。
 - **更正分叉审计**：`GET /audit/correction-forks?revision=` 按指定快照还原更正关系，仅返回存在分叉（同一事件被两个及以上事件直接更正）的更正链，列出根到各生效叶子的完整路径与按参赛者汇总的生效积分；只读，普通线性链不返回。
+- **积分阈值区间**：`GET /participants/{participant_id}/threshold-intervals` 逐 revision 重算单个参赛者的真实生效总分，把"总分 ≥ 阈值"的连续 revision 合并为闭区间，返回区间起止与两端积分；更正链分叉、跨参赛者更正造成的升降都会体现，未出现的参赛者按 0 分处理。
 - **并发安全**：写入经 `BEGIN IMMEDIATE` 串行化，revision 在写锁内分配——并发写入（含批量）不会产生重复 revision 或中间态。
 
 ## 快速启动
@@ -18,7 +19,7 @@
 docker compose up --build
 ```
 
-服务启动后访问 <http://localhost:8000>，交互式文档见 <http://localhost:8000/docs>。
+一条命令完成镜像构建与启动：服务监听容器内 **8000** 端口，并通过 `docker-compose.yml` 的端口映射 `"8000:8000"` 暴露到宿主机同一端口。服务启动后访问 <http://localhost:8000>，交互式文档见 <http://localhost:8000/docs>（如本机 8000 端口被占用，可把映射改为例如 `"8001:8000"`，再访问 <http://localhost:8001>，容器内端口始终是 8000）。
 
 数据持久化在命名卷 `ledger-data` 中（SQLite 文件 `/data/ledger.db`）。
 
@@ -447,6 +448,53 @@ curl 'localhost:8000/participants/compare?left_id=alice&right_id=bob&from_revisi
 
 其中 rev2→rev3 合并为一个区间：rev3 是第三方 carol 的事件，双方分数均未变化。
 
+### 积分阈值区间 `GET /participants/{participant_id}/threshold-intervals`
+
+逐 revision 重算**单个参赛者**的真实生效总分，把"总分大于等于阈值"的连续 revision 合并为**闭区间**返回。三个查询参数均**必填**：
+
+| 查询参数 | 说明 |
+|---|---|
+| `threshold` | 积分阈值，任意整数（含负数）；总分 `>= threshold` 即为命中（边界含等号） |
+| `from_revision` | 起点 revision，允许传 `0` 表示空账本；须满足 `0 ≤ from_revision ≤ to_revision` |
+| `to_revision` | 终点 revision，须满足 `to_revision ≤ 当前 revision` |
+
+- 校验顺序与 `/participants/compare` 一致：顺序非法（缺参/非整数/负数、`from_revision > to_revision`）返回 `422`，`to_revision` 超出当前 revision 返回 `404`（顺序校验先于范围校验）；
+- 对区间内**每个 revision** 按与 `/leaderboard` 相同的生效规则重算该参赛者总分（每条更正链只计当时的末端事件，分叉链各分支叶子都计）；
+- 总分连续 `≥ threshold` 的 revision 合并为一个闭区间，区间按 `start_revision` **升序**；每个区间含 `start_revision`、`end_revision` 与两端积分 `start_points`、`end_points`（区间内部积分可以继续变化，只要始终不低于阈值）；
+- 更正把事件从 A 改挂到 B 时，A 扣分与 B 加分在**同一个 revision**（即该更正的 revision）生效：A 可能因此跌出阈值，B 可能因此升入阈值；更正链分叉导致的加分（各分支叶子都计）同样体现；
+- 未在账本中出现过的参赛者按每个 revision **0 分**处理（阈值 `≤ 0` 时仍可能命中）；查询**只读**，不写入账本、不产生新 revision。
+
+```bash
+# 构造数据：rev1 alice+10，rev2 bob+100（第三方，不影响 alice），rev3 alice+5，
+#          rev4 更正 e1 改挂给 bob（alice 由 15 降为 5），rev5 alice+8（13）
+curl -X POST localhost:8000/events/batch -H 'Content-Type: application/json' -d '[
+  {"event_id":"t1","participant_id":"alice","points":10},
+  {"event_id":"t2","participant_id":"bob","points":100},
+  {"event_id":"t3","participant_id":"alice","points":5},
+  {"event_id":"t4","participant_id":"bob","points":10,"correction_of":"t1"},
+  {"event_id":"t5","participant_id":"alice","points":8}
+]'
+
+curl 'localhost:8000/participants/alice/threshold-intervals?threshold=10&from_revision=0&to_revision=5'
+```
+
+alice 的逐 revision 总分为 rev0=0、rev1=10、rev2=10、rev3=15、rev4=5（跨参赛者更正使其跌出）、rev5=13，故命中 `[1,3]` 与 `[5,5]`：
+
+```json
+{
+  "participant_id": "alice",
+  "threshold": 10,
+  "from_revision": 0,
+  "to_revision": 5,
+  "intervals": [
+    {"start_revision": 1, "end_revision": 3, "start_points": 10, "end_points": 15},
+    {"start_revision": 5, "end_revision": 5, "start_points": 13, "end_points": 13}
+  ]
+}
+```
+
+阈值允许为负数或 0（用于识别"不低于 0"的区间）；全程未出现的参赛者恒为 0 分，例如查询 `ghost`、`threshold=0` 时返回覆盖整个范围的单个区间，而 `threshold=1` 时返回空数组。空账本下仅可查 `from_revision=to_revision=0`，其余 revision 返回 `404`。
+
 ### 奖励结算预演 `POST /rewards/preview`
 
 按指定 revision 的排行榜**只读**试算奖金分配，不写入账本、不产生新 revision。请求体：
@@ -578,7 +626,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
 ```
 
-测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致）。
+测试覆盖：幂等重放、409 冲突、更正链末端计数、历史 revision 查询、排行榜排序、50 路并发写入下 revision 唯一且连续，`/leaderboard/page` 游标分页（快照固定、并发续读、篡改/冲突返回 422、末页与空榜），`/leaderboard/changes`（空榜对比、仅名次变化、更正链 A 退出/B 进入、参数顺序 422、超范围 404、按 `participant_id` 排序），`/events/changes`（空账本对比、更正合并为 `replaced`、链分叉记 `added`、非一进一出不合并、before/after 完整事件、按链根排序、参数顺序 422、超范围 404、路由不被 `/events/{event_id}` 遮蔽），`/events/batch`（连续 revision 与同序响应、批内唯一、引用更早项/后续项/未知项、全量重放 200、部分重放与异载荷 409、失败整批回滚不耗 revision、批量并发下 revision 块连续），以及 `/participants/{participant_id}/score-breakdown`（空账本与未知参赛者返回 0 与空数组、更正链只计末端且 history 完整、历史 revision 固定快照、revision 0 空快照、更正转移后旧参赛者不再保留该链而新归属者 history 展示此前归属、按链根升序、分叉链每末端各成一项、总分与 `/leaderboard` 一致、默认取当前 revision、负数 422、超范围 404），以及 `/participants/compare`（区间合并与边界、子范围与 `from == to`、更正改挂在同一 revision 双方同时变动、更正链只计末端、分叉链只扣一次、双方无分/未知参赛者返回覆盖全范围的 tie、双方同一人恒为 tie、空账本 0→0、区间无缝覆盖整个范围、逐 revision 与 `/leaderboard` 总分一致、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、字面路由不被遮蔽），以及 `/participants/{participant_id}/threshold-intervals`（区间合并与边界含等号、区间两端积分可不同、子范围与 `from == to`、阈值为负/0 与 revision 0、未出现参赛者按 0 分、跨参赛者更正使旧归属方跌出新归属方升入、更正链只计末端、分叉链各分支叶子均计且共享祖先只扣一次、逐 revision 与 `/leaderboard` 总分一致、区间按起点升序、缺参/非整数/负数/`from > to` 返回 422、超范围 404、顺序校验先于范围校验、查询只读不写账本），以及 `/rewards/preview`（空账本返回空获奖者、按名次发奖、并列组合并奖金池均分、余数分币按 `participant_id` 升序分配且总额守恒、组跨有奖区边界只合并区内名次、区外组不获奖、0 奖金名次仍在区内、指定历史 revision 快照、更正链只计末端、越界 revision 返回 404、奖金数组 1～100 个非负整数校验 422、预演不写入账本），以及 `/audit/correction-forks`（空账本与 revision 0 返回空、普通线性链与独立事件不返回、分叉列出各分支根到生效叶子的完整路径、分叉后的链式更正归入各自分支、非根节点分叉与多个分叉点共享链根、按参赛者汇总生效积分且被取代节点不计、历史 revision 固定快照、分叉形成前后的快照差异、`chain_root` 与叶子 `(revision, event_id)` 稳定排序、批量写入的分叉可见、默认最新、超范围 404、负数/非整数 422、只读不写账本），以及 `/events/preview`（空账本基线推演、虚拟 revision 与草案生效明细、基线固定快照忽略后续账本事件、base_revision 0 忽略全账本、草案更正基线事件只计末端、批内草案链式更正、草案分叉基线链保留各分支叶子、更正改挂产生退出/进入、并列按 `participant_id` 排序且名次连续、仅名次变化与无变化空 changes、与基线及基线后账本事件重名 409、409 先于 422、引用后续草案/未知事件/基线后账本事件/自引用 422、批内重复 422、越界基线 404、负数/非整数/缺参 422、草案条数 1～100 校验、预演不写库不耗 revision、推演结果与真实写入后的 `/leaderboard` 及 `/leaderboard/changes` 一致）。
 
 ## 设计要点
 
@@ -590,6 +638,7 @@ pytest -v
 - **分叉审计**：`/audit/correction-forks` 在单个读快照内取出 `revision ≤ R` 的全部事件并建立 `correction_of` 森林；任一事件在快照内有 ≥2 个直接更正（子节点）即为分叉，收集其链根。每个分叉链列出全部无后任的节点（即各分支生效叶子，与 `/leaderboard` 生效判定一致）及沿父链回溯的根→叶完整路径，并把叶子积分按 `participant_id` 汇总；无分叉的线性链不输出。纯读，默认最新，0 为空快照，超范围 404。
 - **积分归因**：`/participants/{participant_id}/score-breakdown` 在单个读快照内取 `revision ≤ R` 的全部事件，未被更正的事件即各链生效末端；属于目标参赛者的末端沿 `correction_of` 上溯到链根，生成 `(chain_root, effective_event, history)` 三元组，按链根 `event_id` 升序输出；`total_points` 为各生效末端积分之和，与 `/leaderboard` 同 revision 的总分一致。
 - **双方对比**：`/participants/compare` 在单个读快照内取出 `revision ≤ to_revision` 的全部事件后按 revision 升序**重放**一次：事件写入即生效（更正的 revision 必然更大），被**首个**直接更正取代时失效——因此更正改挂参赛者时，原归属方扣分与新归属方加分落在同一个 revision 上；分叉更正只扣一次。重放经过 `[from_revision, to_revision]` 内每个 revision 时记录双方总分，相邻且双方分数都相同的快照合并为闭区间，与逐 revision 调用 `/leaderboard` 的结果一致。
+- **阈值区间**：`/participants/{participant_id}/threshold-intervals` 复用 `/participants/compare` 的单次读快照重放，只跟踪目标参赛者一人的有效总分：事件写入时若归属该参赛者则加分，其**首个**直接更正在更正所在 revision 让原事件失效（原归属该参赛者则扣分，跨参赛者改挂因此一升一降落在同一 revision；分叉链各分支叶子均有效、共享祖先只失效一次）。重放经过 `[from_revision, to_revision]` 内每个 revision，把总分 `≥ threshold`（含边界）的连续快照合并为闭区间，记录两端积分并按起点升序输出；未出现的参赛者全程为 0。校验顺序：参数顺序 422 → `to_revision` 超范围 404。纯读：只开只读事务，不写账本、不消耗 revision。
 - **奖励预演**：`/rewards/preview` 复用 `/leaderboard` 的生效判定与排序，在单个读快照内计算指定 revision 的排行榜（纯读，不写账本）。总分相同者按 `participant_id` 升序构成并列组，覆盖连续名次区间；组与有奖区（第 1～N 名，N 为奖金数组长度）有交集时，将组覆盖的区内名次奖金合并为全组奖金池均分，余数分币按 `participant_id` 升序每人 1 分——发放总额恒等于奖金池。
 - **情景预演**：`/events/preview` 在单个读快照内取出 `revision ≤ base_revision` 的基线事件，与草案事件（虚拟 revision 为 `base_revision + 数组下标 + 1`）合并后套用账本同一生效判定——被任一后续事件（含草案）更正的事件不计，分叉链各分支叶子均计；聚合、排序、名次与 `changes` 差异计算直接复用 `/leaderboard` 与 `/leaderboard/changes` 的实现。校验顺序：基线越界 404 → 草案 `event_id` 与账本任意事件重名 409 → 非法引用 422。全程只读：不开写事务、不插入事件、不消耗 revision。
 - **并发**：所有写操作在 `BEGIN IMMEDIATE` 事务内先取写锁、再计算 `MAX(revision)+1` 并插入（批量为一段连续块），配合 `busy_timeout`，写者完全串行；读者走 WAL 快照，互不阻塞。
