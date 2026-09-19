@@ -22,6 +22,7 @@ from .schemas import (
     RewardPreviewIn,
     RewardPreviewOut,
     ScoreBreakdownOut,
+    ThresholdIntervalsOut,
 )
 
 
@@ -264,6 +265,31 @@ def get_score_breakdown(
     ),
 ) -> ScoreBreakdownOut:
     return ledger.score_breakdown(participant_id, revision)
+
+
+@app.get(
+    "/participants/{participant_id}/threshold-intervals",
+    response_model=ThresholdIntervalsOut,
+    responses={
+        404: {"description": "to_revision beyond the current maximum"},
+        422: {"description": "Missing/non-integer params, or invalid revision ordering"},
+    },
+)
+def get_threshold_intervals(
+    participant_id: str,
+    threshold: int = Query(description="Inclusive points threshold."),
+    from_revision: int = Query(
+        description="First snapshot revision; 0 means the empty ledger.",
+        ge=0,
+    ),
+    to_revision: int = Query(
+        description="Last snapshot revision; must be >= from_revision.",
+        ge=0,
+    ),
+) -> ThresholdIntervalsOut:
+    return ledger.threshold_intervals(
+        participant_id, threshold, from_revision, to_revision
+    )
 
 
 @app.post(
